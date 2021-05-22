@@ -7,7 +7,9 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::io::Write;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton};
+use itertools::Itertools;
+use necst::Registry;
 
 fn main() {
     let table = read_table();
@@ -17,10 +19,10 @@ fn main() {
     // print_table_raw(&table);
     // print_table_ecs(&world);
     // print_table_ecs_hierarchical(&world);
-    run_tui(&world);
+    run_tui(&mut world);
 }
 
-fn run_tui(world: &World) {
+fn run_tui(world: &mut World) {
     // let mut stdout = BufWriter::new(std::io::stdout()); // BufWriter decreases flickering
     let mut stdout = std::io::stdout();
 
@@ -51,7 +53,7 @@ fn run_tui(world: &World) {
     terminal::disable_raw_mode().unwrap();
 }
 
-fn tui_loop<W: std::io::Write>(stdout: &mut W, world: &World) {
+fn tui_loop<W: std::io::Write>(stdout: &mut W, world: &mut World) {
     let mut canvas = Canvas::default();
     canvas.resize(terminal::size().unwrap());
 
@@ -69,14 +71,20 @@ fn tui_loop<W: std::io::Write>(stdout: &mut W, world: &World) {
 
         // Event handling
         let mut quit = false;
-        event_loop(&mut quit);
+        event_loop(&mut quit, world, &mut canvas);
         if quit {
             break;
         }
     }
 }
 
-fn event_loop(quit: &mut bool) {
+#[derive(Default, Debug)]
+struct LeftClicked();
+
+#[derive(Default, Debug)]
+struct LeftReleased();
+
+fn event_loop(quit: &mut bool, world: &mut World, canvas: &mut Canvas) {
     loop {
         match event::read().unwrap() {
             Event::Key(key) => {
@@ -90,8 +98,73 @@ fn event_loop(quit: &mut bool) {
                     }
                 }
             }
-            Event::Mouse(_) => {}
-            Event::Resize(_cols, _rows) => { break; }
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::Down(button) => {
+                        if button == MouseButton::Left {
+                            let entity = canvas.matrix[mouse.row as usize][mouse.column as usize].as_ref();
+                            eprintln!("clicked on {:?}", entity);
+                            if let Some(entity) = entity {
+                                let mut entry = world.entry(*entity).unwrap();
+                                entry.add_component(LeftClicked());
+                                break;
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(button) => {
+                        if button == MouseButton::Left {
+                            let entity = canvas.matrix[mouse.row as usize][mouse.column as usize].as_ref();
+                            eprintln!("released on {:?}", entity);
+                            if let Some(entity) = entity {
+                                let mut entry = world.entry(*entity).unwrap();
+                                entry.add_component(LeftReleased());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                let mut should_break = false;
+                let mut left_clicked_entt = None;
+                let mut query = <(Entity, &Cell, &Parent, &LeftClicked)>::query();
+                for (entt, cell, parent, left_clicked) in query.iter(world) {
+                    left_clicked_entt = Some((entt.clone(), parent.0.clone()));
+                    break;
+                }
+                let mut left_released_entt = None;
+                let mut query = <(Entity, &Cell, &Parent, &LeftReleased)>::query();
+                for (entt, cell, parent, left_released) in query.iter(world) {
+                    left_released_entt = Some((entt.clone(), parent.0.clone()));
+                    break;
+                }
+                if left_clicked_entt.is_some() && left_released_entt.is_some() {
+                    let clicked_entt = left_clicked_entt.unwrap();
+                    let released_entt = left_released_entt.unwrap();
+                    if clicked_entt.1 == released_entt.1 {
+                        let mut parent_entry = world.entry_mut(released_entt.1).unwrap();
+                        let mut row = parent_entry.get_component_mut::<Row>().unwrap();
+                        let clicked_entt = row.cells.iter().find_position(|entt| *entt == &clicked_entt.0).unwrap().0;
+                        let released_entt = row.cells.iter().find_position(|entt| *entt == &released_entt.0).unwrap().0;
+                        row.cells.swap(clicked_entt, released_entt);
+                        should_break = true;
+                    }
+                    {
+                        let mut clicked_entry = world.entry(clicked_entt.0).unwrap();
+                        clicked_entry.remove_component::<LeftClicked>();
+                    }
+                    {
+                        let mut released_entry = world.entry(released_entt.0).unwrap();
+                        released_entry.remove_component::<LeftReleased>();
+                    }
+                }
+                if should_break {
+                    break;
+                }
+            }
+            Event::Resize(cols, rows) => {
+                canvas.resize((cols, rows));
+                break;
+            }
         }
     }
 }
@@ -115,7 +188,7 @@ fn draw<W: std::io::Write>(out: &mut W, world: &World, canvas: &mut Canvas) {
 
 #[derive(Debug, Default)]
 struct Canvas {
-    matrix: Vec<Vec<Option<Entity>>>, // TODO: transform into a single vector
+    pub matrix: Vec<Vec<Option<Entity>>>, // TODO: transform into a single vector
 }
 
 impl Canvas {
@@ -131,7 +204,7 @@ impl Canvas {
     // TODO Methods:
     // paint_with_rect ? an entity clickable area might be larger that what it writes on
     // paint_row ?
-    // paint_with_depth ?
+    // paint_with_depth ?,
 
     fn resize(&mut self, (col, row): (u16, u16)) {
         // TODO: reuse current cells, no need to reallocate everything, only delete what's necessary
@@ -151,6 +224,31 @@ impl Canvas {
             }
             writeln!(out);
         }
+    }
+}
+
+fn print_table_ecs_hierarchical_n<W: std::io::Write>(out: &mut W, registry: &Registry, canvas: &mut Canvas) {
+    for (_entt, (table, )) in registry.view_all::<(TableN, )>() {
+        writeln!(out);
+        for header_entt in &table.headers {
+            let header = registry.get::<Header>(*header_entt).unwrap();
+            let selected = registry.get::<Selected>(*header_entt).is_some();
+            let data = format!("{}{}{}, ", if selected { "[" } else { "" }, header.0, if selected { "]" } else { "" });
+            write!(out, "{}", data);
+        }
+        writeln!(out);
+        for row_entt in &table.rows {
+            let row = registry.get::<RowN>(*row_entt).unwrap();
+            for cell_entt in &row.cells {
+                let cell = registry.get::<Cell>(*cell_entt).unwrap();
+                let selected = registry.get::<Selected>(*cell_entt).is_some();
+                let clicked = registry.get::<LeftClicked>(*cell_entt).is_some();
+                let data = format!("{}{}{}, ", if selected || clicked { "[" } else { "" }, cell.0, if selected || clicked { "]" } else { "" });
+                write!(out, "{}", data);
+            }
+            writeln!(out);
+        }
+        writeln!(out);
     }
 }
 
@@ -176,7 +274,8 @@ fn print_table_ecs_hierarchical<W: std::io::Write>(out: &mut W, world: &World, c
                 let cell_entry = world.entry_ref(*cell_entt).unwrap();
                 let cell = cell_entry.get_component::<Cell>().unwrap();
                 let selected = cell_entry.get_component::<Selected>().is_ok();
-                let data = format!("{}{}{}, ", if selected { "[" } else { "" }, cell.0, if selected { "]" } else { "" });
+                let clicked = cell_entry.get_component::<LeftClicked>().is_ok();
+                let data = format!("{}{}{}, ", if selected || clicked { "[" } else { "" }, cell.0, if selected || clicked { "]" } else { "" });
                 canvas.paint(*cell_entt, data.len());
                 write!(out, "{}", data);
             }
@@ -223,11 +322,22 @@ struct Table {
 }
 
 #[derive(Debug, Default)]
+struct TableN {
+    headers: Vec<necst::Entity>,
+    rows: Vec<necst::Entity>,
+}
+
+#[derive(Debug, Default)]
 struct Header(String);
 
 #[derive(Debug, Default)]
 struct Row {
     cells: Vec<Entity>
+}
+
+#[derive(Debug, Default)]
+struct RowN {
+    cells: Vec<necst::Entity>
 }
 
 #[derive(Debug, Default)]
@@ -238,6 +348,26 @@ struct Parent(Entity);
 
 #[derive(Debug)]
 struct Selected();
+
+#[derive(Debug)]
+struct ParentN(necst::Entity);
+
+fn table_to_ecs_new(table_data: &TableData) {
+    let mut registry = Registry::new();
+    let table = registry.create_with((TableN::default(), ));
+    for header_data in &table_data.headers {
+        let header = registry.create_with((Header(header_data.clone()), ParentN(table)));
+        registry.patch::<TableN>(table).with(|table| table.headers.push(header));
+    }
+    for row_data in &table_data.rows {
+        let row = registry.create_with((RowN::default(), ParentN(table)));
+        registry.patch::<TableN>(table).with(|table| table.rows.push(row));
+        for cell_data in row_data {
+            let cell = registry.create_with((Cell(cell_data.clone()), ParentN(row)));
+            registry.patch::<RowN>(row).with(|row| row.cells.push(cell));
+        }
+    }
+}
 
 fn table_to_ecs(world: &mut World, table_data: &TableData) {
     let table_entt = world.push((Table::default(), ));
